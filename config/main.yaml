@@ -6,10 +6,10 @@ defaults:
   - loss: [mse]
 
 wandb:
-  project: mvsplat
-  entity: placeholder
+  project: new_mvs
+  entity: baiyumo2003
   name: placeholder
-  mode: disabled
+  mode: online
   id: null
 
 mode: train

@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
 import warnings
-
+from rttp_config.new_data_module import RgbdDataModule
+from rttp_config.rttp_config import ConfigRttp as config
 import hydra
 import torch
 import wandb
@@ -107,7 +108,7 @@ def train(cfg_dict: DictConfig):
         max_epochs=-1,
         accelerator="gpu",
         logger=logger,
-        devices="auto",
+        devices=1,
         strategy="ddp" if torch.cuda.device_count() > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
@@ -115,6 +116,7 @@ def train(cfg_dict: DictConfig):
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
+        check_val_every_n_epoch=10,
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
@@ -137,14 +139,25 @@ def train(cfg_dict: DictConfig):
         global_rank=trainer.global_rank,
     )
 
-    if cfg.mode == "train":
-        trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
-    else:
-        trainer.test(
-            model_wrapper,
-            datamodule=data_module,
-            ckpt_path=checkpoint_path,
-        )
+
+    cfg=config()
+    cfg.load("/playpen-ssd/yumo/mvsplat/rttp_config/rttp_config.yaml")
+    cfg=cfg.get_cfg()
+    data_module=RgbdDataModule(
+        cfg
+    )
+
+    # if cfg.mode == "train":
+    # trainer.fit(model_wrapper, train_dataloaders=data_module,
+    #             val_dataloaders=data_module, ckpt_path=checkpoint_path)
+    trainer.fit(model_wrapper,datamodule=data_module,
+                ckpt_path=checkpoint_path)
+    # else:
+    #     trainer.test(
+    #         model_wrapper,
+    #         datamodule=data_module,
+    #         ckpt_path=checkpoint_path,
+    #     )
 
 
 if __name__ == "__main__":

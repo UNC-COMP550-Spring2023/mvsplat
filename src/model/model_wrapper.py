@@ -120,13 +120,110 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
 
-    def training_step(self, batch, batch_idx):
-        batch: BatchedExample = self.data_shim(batch)
+    def training_step(self, batch_in, batch_idx):
+        # batch: BatchedExample = self.data_shim(batch_in)
+        view_gt_list = ["gt_left", "gt_right"]
+        view_in_list = ["middle", "right", "up", "left"]
+        batch = {'context': {}, 'target': {}}
+        for type in ['context', 'target']:
+            batch[type]["image"] = []
+            batch[type]["extrinsics"] = []
+            batch[type]["intrinsics"] = []
+            for view in view_in_list if type == 'context' else view_gt_list:
+                batch[type]["image"].append((batch_in[view]['img']+1)/2)
+                batch[type]["extrinsics"].append(batch_in[view]['extr'])
+                batch[type]["intrinsics"].append(batch_in[view]['intr'])
+            batch[type]["extrinsics"] = torch.stack(batch[type]["extrinsics"], dim=1)
+            batch[type]["intrinsics"] = torch.stack(batch[type]["intrinsics"], dim=1)
+            batch[type]["image"] = torch.stack(batch[type]["image"], dim=1)
+            device = batch[type]["image"].device
+            b, v = batch[type]["image"].shape[:2]
+            batch[type]["near"] = torch.tensor([[1.0] * v] * b).to(device)
+            batch[type]["far"] = torch.tensor([[100.] * v] * b).to(device)
+
         _, _, _, h, w = batch["target"]["image"].shape
+        _, _, _, h, w = batch["target"]["image"].shape
+        batch: BatchedExample = self.data_shim(batch)
+        if False:
+            if self.global_rank == 0:
+                print(
+                    f"validation step {self.global_step}; "
+                    # f"scene = {[a[:20] for a in batch['scene']]}; "
+                    # f"context = {batch['context']['index'].tolist()}"
+                )
+            b, _, _, h, w = batch["target"]["image"].shape
+            assert b == 1
+            gaussians_softmax = self.encoder(
+                batch["context"],
+                self.global_step,
+                deterministic=False,
+            )
+            output_softmax = self.decoder.forward(
+                gaussians_softmax,
+                batch["target"]["extrinsics"],
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (h, w),
+            )
+            rgb_softmax = output_softmax.color[0]
+            # Compute validation metrics.
+            rgb_gt = batch["target"]["image"][0]
+            for tag, rgb in zip(
+                    ("val",), (rgb_softmax,)
+            ):
+                psnr = compute_psnr(rgb_gt, rgb).mean()
+                self.log(f"val/psnr_{tag}", psnr)
+                lpips = compute_lpips(rgb_gt, rgb).mean()
+                self.log(f"val/lpips_{tag}", lpips)
+                ssim = compute_ssim(rgb_gt, rgb).mean()
+                self.log(f"val/ssim_{tag}", ssim)
+
+            # Construct comparison image.
+            comparison = hcat(
+                add_label(vcat(*batch["context"]["image"][0]), "Context"),
+                add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
+                add_label(vcat(*rgb_softmax), "Target (Softmax)"),
+            )
+            self.logger.log_image(
+                "comparison",
+                [prep_image(add_border(comparison))],
+                step=self.global_step,
+                caption='Scene',
+            )
+            # Render projections and construct projection image.
+            projections = hcat(*render_projections(
+                gaussians_softmax,
+                256,
+                extra_label="(Softmax)",
+            )[0])
+            self.logger.log_image(
+                "projection",
+                [prep_image(add_border(projections))],
+                step=self.global_step,
+            )
+
+            # Draw cameras.
+            cameras = hcat(*render_cameras(batch, 256))
+            self.logger.log_image(
+                "cameras", [prep_image(add_border(cameras))], step=self.global_step
+            )
+
+            if self.encoder_visualizer is not None:
+                for k, image in self.encoder_visualizer.visualize(
+                        batch["context"], self.global_step
+                ).items():
+                    self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+            self.render_video_interpolation(batch)
+            self.render_video_wobble(batch)
+            if self.train_cfg.extended_visualization:
+                self.render_video_interpolation_exaggerated(batch)
+
+            print(123)
 
         # Run the model.
         gaussians = self.encoder(
-            batch["context"], self.global_step, False, scene_names=batch["scene"]
+            batch["context"], self.global_step, False, scene_names="Scene"
         )
         output = self.decoder.forward(
             gaussians,
@@ -160,8 +257,8 @@ class ModelWrapper(LightningModule):
         ):
             print(
                 f"train step {self.global_step}; "
-                f"scene = {[x[:20] for x in batch['scene']]}; "
-                f"context = {batch['context']['index'].tolist()}; "
+                # f"scene = {[x[:20] for x in batch['scene']]}; "
+                # f"context = {batch['context']['index'].tolist()}; "
                 f"bound = [{batch['context']['near'].detach().cpu().numpy().mean()} "
                 f"{batch['context']['far'].detach().cpu().numpy().mean()}]; "
                 f"loss = {total_loss:.6f}"
@@ -169,7 +266,6 @@ class ModelWrapper(LightningModule):
         self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
         self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
-
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
@@ -277,14 +373,35 @@ class ModelWrapper(LightningModule):
             self.benchmarker.summarize()
 
     @rank_zero_only
-    def validation_step(self, batch, batch_idx):
-        batch: BatchedExample = self.data_shim(batch)
+    def validation_step(self, batch_in, batch_idx):
+        # batch: BatchedExample = self.data_shim(batch)
+        view_in_list = ["middle", "right", "up", "left"]
+        view_gt_list = ["gt_left", "gt_right"]
+        batch = {'context': {}, 'target': {}}
+
+        for type in ['context', 'target']:
+            batch[type]["image"] = []
+            batch[type]["extrinsics"] = []
+            batch[type]["intrinsics"] = []
+            for view in view_in_list if type == 'context' else view_gt_list:
+                batch[type]["image"].append(batch_in[view]['img'])
+                batch[type]["extrinsics"].append(batch_in[view]['extr'])
+                batch[type]["intrinsics"].append(batch_in[view]['intr'])
+            batch[type]["extrinsics"] = torch.stack(batch[type]["extrinsics"], dim=1)
+            batch[type]["intrinsics"] = torch.stack(batch[type]["intrinsics"], dim=1)
+            batch[type]["image"] = torch.stack(batch[type]["image"], dim=1)
+            device = batch[type]["image"].device
+            b, v = batch[type]["image"].shape[:2]
+            batch[type]["near"] = torch.tensor([[1.0] * v] * b).to(device)
+            batch[type]["far"] = torch.tensor([[100.] * v] * b).to(device)
+
+
 
         if self.global_rank == 0:
             print(
                 f"validation step {self.global_step}; "
-                f"scene = {[a[:20] for a in batch['scene']]}; "
-                f"context = {batch['context']['index'].tolist()}"
+                # f"scene = {[a[:20] for a in batch['scene']]}; "
+                # f"context = {batch['context']['index'].tolist()}"
             )
 
         # Render Gaussians.
@@ -327,7 +444,7 @@ class ModelWrapper(LightningModule):
             "comparison",
             [prep_image(add_border(comparison))],
             step=self.global_step,
-            caption=batch["scene"],
+            caption="scene",
         )
 
         # Render projections and construct projection image.
