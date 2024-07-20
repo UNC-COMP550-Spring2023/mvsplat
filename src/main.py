@@ -116,7 +116,7 @@ def train(cfg_dict: DictConfig):
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
-        check_val_every_n_epoch=10,
+        check_val_every_n_epoch=1,
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
@@ -146,7 +146,7 @@ def train(cfg_dict: DictConfig):
     data_module=RgbdDataModule(
         cfg
     )
-
+    checkpoint_path='/playpen-ssd/yumo/mvsplat_edit/outputs/2024-04-25/20-32-57/checkpoints/epoch_0-step_80000.ckpt'
     # if cfg.mode == "train":
     # trainer.fit(model_wrapper, train_dataloaders=data_module,
     #             val_dataloaders=data_module, ckpt_path=checkpoint_path)
